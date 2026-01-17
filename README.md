@@ -19,7 +19,7 @@ claude --version
 
 This will:
 - Copy the hook script to `~/.claude/hooks/`
-- Auto-merge hook config into your existing `~/.claude/settings.json` (creates backup first)
+- Auto-merge hook config into your existing `~/.claude/settings.json` (creates timestamped backup if modified)
 - Create a new settings file if none exists
 
 ### Manual Install
@@ -52,7 +52,7 @@ Add to `~/.claude/settings.json`:
 
 ```bash
 rm ~/.claude/hooks/validate_tool_safety.py
-# Restore backup if needed: cp ~/.claude/settings.json.backup ~/.claude/settings.json
+# Restore backup if needed: cp ~/.claude/settings.backup.TIMESTAMP.json ~/.claude/settings.json
 # Or manually remove the hook entry from ~/.claude/settings.json
 ```
 
