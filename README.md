@@ -4,11 +4,11 @@ Claude Code hook that auto-approves safe commands and whitelists them. Everythin
 
 ## Requirements
 
-[Ollama](https://ollama.ai) with `qwen2.5-coder:7b`:
+[Claude Code](https://github.com/anthropics/claude-code) CLI installed and authenticated.
 
 ```bash
-ollama pull qwen2.5-coder:7b
-ollama serve
+# Verify installation
+claude --version
 ```
 
 ## Install
@@ -40,5 +40,5 @@ Add to `~/.claude/settings.json`:
 ## How It Works
 
 1. Code-based safety net catches known dangerous patterns (100% reliable)
-2. LLM handles nuanced/novel cases
+2. Claude Haiku handles nuanced/novel cases via Claude Code CLI
 3. Safe commands are auto-whitelisted to `settings.local.json` for future runs

@@ -2,26 +2,23 @@
 """
 Claude Code Hook: LLM-based Tool Safety Validator
 
-Uses Ollama to assess whether a tool call is safe (read-only) or requires
-user confirmation (write/destructive operations).
+Uses Claude Haiku (via Claude Code CLI) to assess whether a tool call is safe
+(read-only) or requires user confirmation (write/destructive operations).
 
-BEHAVIOR: This hook intercepts tool calls and uses an LLM to classify them
+BEHAVIOR: This hook intercepts tool calls and uses Claude Haiku to classify them
 as safe (auto-approve) or potentially dangerous (ask user). The LLM assessment
 provides context-aware safety decisions beyond simple pattern matching.
 """
 
 import json
-import os
+import subprocess
 import sys
-import urllib.request
-import urllib.error
 from pathlib import Path
 from typing import Any
 
 # Configuration
-OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "qwen2.5-coder:7b"  # Good balance of capability and size
-TIMEOUT_SECONDS = 30  # Higher timeout for initial model load
+CLAUDE_MODEL = "haiku"
+TIMEOUT_SECONDS = 60  # Allow time for Claude CLI
 
 # Tools that are always safe (read-only by design)
 ALWAYS_SAFE_TOOLS = {"Read", "Glob", "Grep", "WebSearch", "WebFetch"}
@@ -32,9 +29,6 @@ ALWAYS_ASK_TOOLS = {"Task", "Skill"}
 # Settings file paths
 GLOBAL_SETTINGS = Path.home() / ".claude" / "settings.local.json"
 PROJECT_SETTINGS_NAME = ".claude/settings.local.json"
-
-# Multi-word command tools (use subcommand as base)
-MULTI_WORD_TOOLS = {"go", "npm", "yarn", "cargo", "make", "git", "docker", "kubectl", "python", "pip", "bun"}
 
 # BEHAVIOR: Code-based safety net - catches dangerous patterns before LLM
 # These are checked with simple string matching for 100% reliability
@@ -97,34 +91,11 @@ SAFE_COMMAND_BASES = {
     "find ", "grep ", "wc ", "du ", "df ",
 }
 
-WHITELIST_PATTERN_PROMPT = """Given a bash command, suggest the SAFEST permission pattern to whitelist it.
-
-Valid pattern syntax:
-- "Bash(go build:*)" - prefix match, allows "go build", "go build ./...", "go build -v"
-- "Bash(npm *)" - wildcard, allows "npm install", "npm test", "npm run dev"
-- "Bash(git * main)" - allows "git checkout main", "git merge main"
-- "Bash(exact cmd)" - exact match only
-
-Return a pattern ONLY if ALL possible matching commands are safe:
-- Could adding ANY flags make it dangerous? If yes → "none"
-- Could changing arguments cause harm? If yes → "none"
-- Does it only read/display/build/test? If yes → safe pattern
-
-Return "none" if:
-- Different arguments could be destructive (git push → git push --force)
-- It deletes data, makes network requests, runs arbitrary code, or changes system state
-
-Think: "If I whitelist this pattern, what's the WORST command that would match?"
-
-Respond with ONLY: {"pattern": "Bash(...)"} or {"pattern": "none"}
-"""
-
-SYSTEM_PROMPT = """Evaluate if this command is safe to run without user confirmation.
+SYSTEM_PROMPT = """Evaluate if this bash command is safe to run without user confirmation.
 
 SAFE if the command:
 - Only reads, displays, or queries information
 - Builds, compiles, or tests code (local operations)
-- Installs dependencies from standard registries
 - Checks versions or system info
 
 UNSAFE if the command:
@@ -136,9 +107,22 @@ UNSAFE if the command:
 - Changes permissions or ownership (chmod, chown, sudo)
 - Has irreversible effects (git reset --hard, git clean, drop)
 
-Think: "Could this command leak secrets, destroy data, or cause harm?"
+If SAFE, suggest a whitelist pattern using Claude Code's syntax:
+- "Bash(cmd:*)" - prefix match: "Bash(go build:*)" matches "go build", "go build ./...", "go build -v"
+- "Bash(cmd *)" - prefix wildcard: "Bash(git diff *)" matches "git diff HEAD", "git diff main"
+- "Bash(* cmd)" - suffix wildcard: "Bash(* --version)" matches "node --version", "python --version"
+- "Bash(cmd * arg)" - middle wildcard: "Bash(git * main)" matches "git checkout main", "git merge main"
+- "Bash(cmd)" - exact match only (avoid this, prefer :* for flexibility)
 
-Respond with ONLY: {"safe": true, "reason": "..."} or {"safe": false, "reason": "..."}
+Pattern guidelines:
+- Use "Bash(tool subcommand:*)" for multi-word commands: "Bash(go test:*)", "Bash(npm run:*)", "Bash(git status:*)"
+- Use "Bash(tool:*)" for single commands: "Bash(ls:*)", "Bash(make:*)"
+- Use "none" ONLY if ANY variation could be dangerous (e.g., git push could become git push --force)
+
+Respond with ONLY valid JSON:
+{"safe": true, "reason": "...", "pattern": "Bash(...)"}
+or
+{"safe": false, "reason": "...", "pattern": "none"}
 """
 
 
@@ -168,69 +152,49 @@ def get_settings_path() -> Path:
     return GLOBAL_SETTINGS
 
 
-def extract_permission_pattern(command: str) -> str:
-    """Extract base command for whitelist pattern at subcommand level."""
-    parts = command.strip().split()
-    if not parts:
-        return f"Bash({command}:*)"
+def is_command_whitelisted(command: str) -> bool:
+    """Check if command matches any pattern in the whitelist."""
+    import fnmatch
 
-    # For multi-word tools, use first two words (e.g., "go test" -> "Bash(go test:*)")
-    if len(parts) >= 2 and parts[0] in MULTI_WORD_TOOLS:
-        base = f"{parts[0]} {parts[1]}"
-    else:
-        base = parts[0]
-
-    return f"Bash({base}:*)"
-
-
-def get_whitelist_pattern(command: str) -> str | None:
-    """Ask LLM to suggest the safest whitelist pattern for a command."""
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": f"Command: {command}",
-        "system": WHITELIST_PATTERN_PROMPT,
-        "stream": False,
-        "options": {
-            "temperature": 0.1,
-            "num_predict": 100,
-        },
-    }
+    settings_path = get_settings_path()
+    if not settings_path.exists():
+        return False
 
     try:
-        req = urllib.request.Request(
-            OLLAMA_URL,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            response_text = result.get("response", "")
+        settings = json.loads(settings_path.read_text())
+        allow_list = settings.get("permissions", {}).get("allow", [])
+    except (json.JSONDecodeError, KeyError):
+        return False
 
-            start = response_text.find("{")
-            end = response_text.rfind("}") + 1
-            if start != -1 and end > start:
-                llm_result = json.loads(response_text[start:end])
-                pattern = llm_result.get("pattern", "none")
-                if pattern and pattern != "none":
-                    return pattern
-    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError):
-        pass
+    for pattern in allow_list:
+        # Extract pattern from Bash(...) format
+        if pattern.startswith("Bash(") and pattern.endswith(")"):
+            bash_pattern = pattern[5:-1]  # Remove "Bash(" and ")"
 
-    return None
+            # Handle :* prefix matching
+            if bash_pattern.endswith(":*"):
+                prefix = bash_pattern[:-2]
+                if command.startswith(prefix):
+                    return True
+            # Handle * wildcards using fnmatch
+            elif "*" in bash_pattern:
+                if fnmatch.fnmatch(command, bash_pattern):
+                    return True
+            # Exact match
+            elif command == bash_pattern:
+                return True
+
+    return False
 
 
-def add_to_whitelist(command: str) -> None:
-    """Add permission pattern to the closest settings.local.json if safe."""
-    # BEHAVIOR: Code-based safety net first (100% reliable)
+def add_to_whitelist(command: str, pattern: str) -> None:
+    """Add permission pattern to the closest settings.local.json."""
+    # BEHAVIOR: Code-based safety net (100% reliable)
     if check_never_whitelist(command):
         return
     if check_unsafe_command(command):
         return
-
-    # BEHAVIOR: Ask LLM for the safest pattern to whitelist this command
-    pattern = get_whitelist_pattern(command)
-    if not pattern:
+    if not pattern or pattern == "none":
         return
 
     settings_path = get_settings_path()
@@ -254,37 +218,30 @@ def add_to_whitelist(command: str) -> None:
         settings_path.write_text(json.dumps(settings, indent=2) + "\n")
 
 
-def query_ollama(prompt: str) -> dict[str, Any] | None:
-    """Query Ollama for safety assessment."""
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "system": SYSTEM_PROMPT,
-        "stream": False,
-        "options": {
-            "temperature": 0.1,  # Low temperature for consistent classification
-            "num_predict": 100,  # Short response expected
-        },
-    }
-
+def query_claude(prompt: str, system_prompt: str) -> dict[str, Any] | None:
+    """Query Claude Haiku via Claude Code CLI for safety assessment."""
+    full_prompt = f"{system_prompt}\n\n{prompt}"
     try:
-        req = urllib.request.Request(
-            OLLAMA_URL,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        result = subprocess.run(
+            ["claude", "-p", full_prompt, "--model", CLAUDE_MODEL, "--output-format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT_SECONDS,
         )
-        with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            response_text = result.get("response", "")
+        if result.returncode != 0:
+            return None
 
-            # Extract JSON from response
-            start = response_text.find("{")
-            end = response_text.rfind("}") + 1
-            if start != -1 and end > start:
-                return json.loads(response_text[start:end])
-    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as e:
-        print(f"Ollama query failed: {e}", file=sys.stderr)
+        # Parse JSON output - claude outputs JSON with "result" field containing the response
+        output = json.loads(result.stdout)
+        response_text = output.get("result", "")
+
+        # Extract JSON from response text
+        start = response_text.find("{")
+        end = response_text.rfind("}") + 1
+        if start != -1 and end > start:
+            return json.loads(response_text[start:end])
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as e:
+        print(f"Claude query failed: {e}", file=sys.stderr)
     return None
 
 
@@ -357,15 +314,18 @@ def main() -> None:
 
         # BEHAVIOR: Code-based safe check (100% reliable, no LLM needed)
         if check_safe_command(command):
-            add_to_whitelist(command)
             decision = make_decision(True, "Code safety check: known safe command")
             if decision:
                 print(json.dumps(decision))
             sys.exit(0)
 
+        # BEHAVIOR: Already whitelisted - let Claude Code handle (no LLM needed)
+        if is_command_whitelisted(command):
+            sys.exit(0)
+
     # For commands not caught by code checks, use LLM
     analysis_prompt = format_tool_for_analysis(tool_name, tool_input)
-    llm_result = query_ollama(analysis_prompt)
+    llm_result = query_claude(analysis_prompt, SYSTEM_PROMPT)
 
     if llm_result is None:
         # BEHAVIOR: If LLM unavailable, let Claude Code decide (respects whitelist)
@@ -373,12 +333,13 @@ def main() -> None:
 
     safe = llm_result.get("safe", False)
     reason = llm_result.get("reason", "LLM assessment")
+    pattern = llm_result.get("pattern", "none")
 
     # BEHAVIOR: Auto-whitelist safe Bash commands for future runs
     if safe and tool_name == "Bash":
         command = tool_input.get("command", "")
-        if command:
-            add_to_whitelist(command)
+        if command and pattern:
+            add_to_whitelist(command, pattern)
 
     decision = make_decision(safe, f"LLM assessment: {reason}")
     if decision:
