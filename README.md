@@ -1,6 +1,6 @@
 # Claude Code Prompt Me Less
 
-Claude Code hook that auto-approves safe commands and whitelists them. Everything else prompts as usual.
+Claude Code hook that auto-approves and whitelists safe commands (`ls`, `git status`, `npm test`...) while leaving others (`rm -rf`, `curl | bash`...) to the normal approval flow.
 
 ## Requirements
 
