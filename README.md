@@ -16,7 +16,8 @@ claude --version
 In a Claude Code session, run:
 
 ```
-/plugin install sultano/claude-code-prompt-me-less
+/plugin marketplace add sultano/claude-code-prompt-me-less
+/plugin install prompt-me-less@sultano-plugins
 ```
 
 ## Uninstall
@@ -25,6 +26,7 @@ In a Claude Code session, run:
 
 ```
 /plugin uninstall prompt-me-less
+/plugin marketplace remove sultano-plugins
 ```
 
 ## How It Works

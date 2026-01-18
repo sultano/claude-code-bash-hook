@@ -1,0 +1,14 @@
+{
+  "name": "sultano-plugins",
+  "owner": {
+    "name": "sultano"
+  },
+  "plugins": [
+    {
+      "name": "prompt-me-less",
+      "source": "./",
+      "description": "Auto-approves safe commands, asks for dangerous ones",
+      "version": "1.0.0"
+    }
+  ]
+}
